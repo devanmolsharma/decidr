@@ -33,7 +33,7 @@ decision.probabilities   # {'access': 0.9965, 'billing': 0.0017, 'sales': 0.0018
 
 That's the whole thing: `state` is what the model reads, `question` is what it's deciding, `options` is the closed set of possible answers, each with an `id` you'll match on in your own code and a `description` for the model to read.
 
-## Quickstart: a hosted model (OpenAI, Anthropic, etc.)
+## Quickstart: a hosted model (OpenAI, Bedrock, etc.)
 
 ```bash
 pip install decidr[litellm]
@@ -61,7 +61,7 @@ decision = client.decide({
 })
 ```
 
-`LiteLLMBackend` routes through [LiteLLM](https://github.com/BerriAI/litellm), so anything LiteLLM can reach, `decidr` can: `model="claude-3-5-haiku-20241022"` with `LiteLLMBackend(api_key="...")` for Anthropic, `model="bedrock/anthropic.claude-3-haiku..."` for Bedrock, and so on — the model string is whatever LiteLLM expects for that provider. Details and a real caveat worth knowing first: [docs/PROVIDERS.md](https://github.com/devanmolsharma/decidr/blob/main/docs/PROVIDERS.md).
+`LiteLLMBackend` routes through [LiteLLM](https://github.com/BerriAI/litellm), so anything LiteLLM can reach *and that actually returns `logprobs`*, `decidr` can: `model="bedrock/meta.llama3-1-8b-instruct-v1:0"` for Bedrock, and so on — the model string is whatever LiteLLM expects for that provider. **Anthropic (Claude) is a notable exception**: Claude's API has no `logprobs` field on any route, so no client library can reach it for this. Details and the full caveat: [docs/PROVIDERS.md](https://github.com/devanmolsharma/decidr/blob/main/docs/PROVIDERS.md).
 
 ## Writing a `row`
 

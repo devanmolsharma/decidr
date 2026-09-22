@@ -4,9 +4,13 @@
 standard library -- it's what every example and test in this project uses.
 `LiteLLMBackend` is optional (`pip install decidr[litellm]`) and routes the
 same calls through LiteLLM (https://github.com/BerriAI/litellm), which
-understands 100+ providers -- OpenAI, Anthropic, Bedrock, hosted vLLM, and
-Ollama itself -- behind one call, so decidr can run against a hosted model
-without decidr itself depending on LiteLLM by default.
+understands 100+ providers -- OpenAI, Bedrock, hosted vLLM, and Ollama
+itself (though not for logprobs -- see below) -- behind one call, so decidr
+can run against a hosted model without decidr itself depending on LiteLLM
+by default. Anthropic (Claude) is a provider LiteLLM reaches but decidr
+still can't use through it: Claude's API has no `logprobs` field on any
+route, checked directly against Anthropic's own docs, not assumed -- see
+docs/PROVIDERS.md.
 
 Both implement the same one-method contract: given the messages for one
 race, return the model's reply and its logprobs at that position, in one
@@ -105,9 +109,16 @@ class OllamaBackend(Backend):
 
 class LiteLLMBackend(Backend):
     """Routes through LiteLLM instead of talking to Ollama directly, so
-    `Client` can run against any provider LiteLLM supports: OpenAI,
-    Anthropic, Bedrock, a hosted vLLM endpoint, or Ollama itself under a
-    different name. Not installed by default -- `pip install decidr[litellm]`.
+    `Client` can run against any provider LiteLLM supports that actually
+    returns `logprobs`: OpenAI, Bedrock, a hosted vLLM endpoint, or Ollama
+    itself under a different name. Not installed by default --
+    `pip install decidr[litellm]`.
+
+    Anthropic (Claude) is reachable through LiteLLM but not usable here:
+    Claude's API has no `logprobs` field on any route (native Messages API
+    or Anthropic's own OpenAI-compatible endpoint), so this backend can't
+    get anything to score from it regardless of how the call is routed --
+    see docs/PROVIDERS.md.
 
     LiteLLM's own top_logprobs ceiling varies by provider; this backend
     doesn't try to raise or detect it, since decidr's per-level branching
@@ -115,7 +126,7 @@ class LiteLLMBackend(Backend):
     small regardless of what a provider allows.
 
     Any keyword LiteLLM's own `completion()` accepts (`api_key`, `api_base`,
-    a routed model name like `"gpt-4o-mini"` or `"anthropic/claude-3-5-haiku"`)
+    a routed model name like `"gpt-4o-mini"` or `"bedrock/meta.llama3-1-8b..."`)
     can be passed here and is forwarded on every call.
     """
 
