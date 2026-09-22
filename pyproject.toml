@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "decidr"
-version = "0.7.0"
-description = "Typed decisions from local LLMs in one forward pass, via Ollama"
+version = "0.7.1"
+description = "Typed decisions from an LLM in one forward pass, local via Ollama or hosted via LiteLLM"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["llm", "ollama", "classification", "routing", "logprobs", "decisions"]
+keywords = ["llm", "ollama", "litellm", "classification", "routing", "logprobs", "decisions"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
