@@ -1,0 +1,34 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "decidr"
+version = "0.7.0"
+description = "Typed decisions from local LLMs in one forward pass, via Ollama"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["llm", "ollama", "classification", "routing", "logprobs", "decisions"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+litellm = ["litellm>=1.0"]
+
+[project.urls]
+Homepage = "https://github.com/devanmolsharma/decidr"
+Issues = "https://github.com/devanmolsharma/decidr/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/decidr"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
