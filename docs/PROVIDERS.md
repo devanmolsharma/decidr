@@ -67,6 +67,42 @@ client = Client(
 
 `LiteLLMBackend(**kwargs)` forwards every keyword straight to LiteLLM's own `completion()` — `api_key`, `api_base`, `aws_region_name`, whatever that provider needs. The `model` string follows [LiteLLM's own provider naming](https://docs.litellm.ai/docs/providers). This covers many providers this way: OpenAI, Bedrock (non-Claude models), Vertex AI, a self-hosted vLLM endpoint, and more — as long as the underlying model actually returns `logprobs`, which is a property of the model/provider, not of LiteLLM. A Claude model routed through Bedrock or Vertex still has no `logprobs` to return, the same as calling Anthropic directly.
 
+## How to tell if a provider will work, before wiring it up
+
+There's no universal registry of who supports `logprobs` — it changes as providers ship features, so treat the table below as a starting point to verify, not a guarantee. Two ways to check a specific provider without writing any `decidr` code first:
+
+1. **Read that provider's own API reference** for its chat completions endpoint and search it for `logprobs` / `top_logprobs`. If the parameter isn't documented at all, or is documented as accepted-but-ignored (as Anthropic's OpenAI-compat layer does), the provider won't work here regardless of what `decidr` or LiteLLM does.
+2. **Send one raw request yourself** before involving `decidr`, and check whether a `logprobs` object actually comes back on the choice:
+
+   ```bash
+   curl https://your-provider.example.com/v1/chat/completions \
+     -H "Authorization: Bearer $API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model": "your-model",
+       "messages": [{"role": "user", "content": "Say hi."}],
+       "max_tokens": 1,
+       "logprobs": true,
+       "top_logprobs": 5
+     }'
+   ```
+
+   If `choices[0].logprobs.content` is present and non-empty, the provider supports it. If it's missing, `null`, or the request errors on the `logprobs`/`top_logprobs` fields, it doesn't — `LiteLLMBackend` will fail the same way `decide()` would, just without spending a hierarchy's worth of requests finding out.
+
+### Providers known to support `logprobs`
+
+Checked against each provider's own documentation, not assumed — but providers change this without notice, so verify with the request above before depending on it in production:
+
+| Provider | Notes |
+|---|---|
+| OpenAI | Standard chat models only (`gpt-4o` family, `gpt-4.1`); reasoning models (o-series) reject `logprobs`. |
+| Together AI | Documented support for `logprobs`/`top_logprobs`; note `logprobs` and streaming (`stream=True`) are mutually exclusive on their API — `decidr` doesn't stream, so this doesn't affect it. |
+| Groq | OpenAI-compatible endpoint; verify current `top_logprobs` cap before relying on a specific value. |
+| Fireworks AI | OpenAI-compatible endpoint; reported `top_logprobs` cap is lower than OpenAI's (around 5) — `OllamaBackend`/`LiteLLMBackend` always request the max, so expect the response to come back capped rather than erroring, which is fine for `decidr`'s mechanism (it just means fewer alternatives to match against per step). |
+| Self-hosted vLLM | Implements the OpenAI-compatible server spec including `logprobs`/`top_logprobs` directly; this is the same shape Together, Fireworks, and several other hosted providers build on. |
+
+**Not currently usable**, regardless of routing: Anthropic/Claude (see [above](#anthropic-claude-is-not-currently-reachable)) and any reasoning-focused model on any provider (the API contract is built around a hidden reasoning step instead of a plain next-token distribution, and `logprobs` is typically rejected or ignored as a result).
+
 ## `LiteLLMBackend` is not a way to reach a local Ollama
 
 Checked directly, not assumed: LiteLLM's own Ollama integration (`ollama/` and `ollama_chat/` model prefixes) does not forward `logprobs`/`top_logprobs` at all —
