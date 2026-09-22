@@ -72,6 +72,12 @@ class Candidate:
         return self.remaining == "" or self.unscored_reason is not None
 
 
+def _is_content_block_list(state) -> bool:
+    """`state` is a list of multimodal content blocks (each a dict with a
+    "type" key) rather than an arbitrary JSON list to be serialized whole."""
+    return isinstance(state, list) and all(isinstance(item, dict) and "type" in item for item in state)
+
+
 def build_prefix_messages(row: dict, prefix: str = "") -> list[dict]:
     """`prefix`: text already emitted, appended as the start of the assistant's
     answer so the next request continues from exactly where the last one
@@ -82,13 +88,27 @@ def build_prefix_messages(row: dict, prefix: str = "") -> list[dict]:
     quote, a bracket, an "options" or "answer" key) rather than treat an
     option's own text as the obvious next word, which starves every option
     but the most likely one of a fair top_logprobs showing.
+
+    `row["state"]` may also be a list of multimodal content blocks (each
+    `{"type": "text"|"image"|"video"|"audio", ...}`) instead of a string or
+    plain JSON value -- see backend.py for how each `Backend` translates
+    that into its provider's own wire format. The instructions (question +
+    options line) are appended as a trailing text block rather than spliced
+    into an existing one, so image/video/audio blocks stay intact.
     """
     options_line = ", ".join(opt["id"] for opt in row["options"])
-    state = row["state"] if isinstance(row["state"], str) else json.dumps(row["state"], ensure_ascii=False)
-    user = f"{state}\n\n{row['question']}\nAnswer with exactly one of: {options_line}."
+    instructions = f"{row['question']}\nAnswer with exactly one of: {options_line}."
+
+    state = row["state"]
+    if _is_content_block_list(state):
+        user_content = [*state, {"type": "text", "text": f"\n{instructions}"}]
+    else:
+        state_text = state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
+        user_content = f"{state_text}\n\n{instructions}"
+
     messages = [
         {"role": "system", "content": PREFIX_SYSTEM},
-        {"role": "user", "content": user},
+        {"role": "user", "content": user_content},
     ]
     if prefix:
         messages.append({"role": "assistant", "content": prefix})

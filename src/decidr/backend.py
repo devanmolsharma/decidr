@@ -55,6 +55,70 @@ class Backend:
         raise NotImplementedError
 
 
+def _to_ollama_message(message: dict) -> dict:
+    """Ollama's `/api/chat` puts text in `content` and takes images
+    separately, as a per-message `images: list[str]` of raw base64 (no
+    `data:` prefix, no URLs). It has no video/audio input at all -- those
+    raise, so decidr never silently drops input the model didn't see."""
+    content = message["content"]
+    if isinstance(content, str):
+        return message
+    text_parts: list[str] = []
+    images: list[str] = []
+    for block in content:
+        block_type = block["type"]
+        if block_type == "text":
+            text_parts.append(block["text"])
+        elif block_type == "image":
+            if not block.get("data"):
+                raise DecisionError(
+                    "OllamaBackend needs inline \"data\" (base64) for an \"image\" block, not a "
+                    "\"url\" -- Ollama has no way to fetch a remote URL itself"
+                )
+            images.append(block["data"])
+        else:
+            raise DecisionError(
+                f'OllamaBackend cannot send a "{block_type}" content block -- Ollama\'s chat API '
+                f"has no {block_type} input"
+            )
+    out = {**message, "content": "".join(text_parts)}
+    if images:
+        out["images"] = images
+    return out
+
+
+def _to_openai_message(message: dict) -> dict:
+    """LiteLLM forwards OpenAI-shaped `content` straight through for
+    providers that support it: an array of typed parts,
+    `{"type": "text", "text": ...}` and
+    `{"type": "image_url", "image_url": {"url": ...}}`, where `url` may be a
+    normal http(s) link or a `data:` URI. No video/audio input on this
+    shape -- those raise."""
+    content = message["content"]
+    if isinstance(content, str):
+        return message
+    parts: list[dict] = []
+    for block in content:
+        block_type = block["type"]
+        if block_type == "text":
+            parts.append({"type": "text", "text": block["text"]})
+        elif block_type == "image":
+            url = block.get("url")
+            if not url:
+                data = block.get("data")
+                if not data:
+                    raise DecisionError('an "image" content block needs "url" or "data"')
+                mime = block.get("mimeType", "image/png")
+                url = f"data:{mime};base64,{data}"
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+        else:
+            raise DecisionError(
+                f'LiteLLMBackend cannot send a "{block_type}" content block -- the chat '
+                f"completions shape has no {block_type} input"
+            )
+    return {**message, "content": parts}
+
+
 class OllamaBackend(Backend):
     """Talks to one Ollama server's `/api/chat`. decidr's only
     dependency-free path -- `urllib` from the standard library, nothing else.
@@ -72,7 +136,7 @@ class OllamaBackend(Backend):
     def chat(self, model: str, messages: list[dict]) -> dict:
         body = {
             "model": model,
-            "messages": messages,
+            "messages": [_to_ollama_message(m) for m in messages],
             "stream": False,
             # A reasoning preamble would put thinking tokens in the answer
             # slot, so the very next token stops being the decision.
@@ -143,7 +207,7 @@ class LiteLLMBackend(Backend):
     def chat(self, model: str, messages: list[dict]) -> dict:
         resp = self._litellm.completion(
             model=model,
-            messages=messages,
+            messages=[_to_openai_message(m) for m in messages],
             max_tokens=1,
             temperature=0,
             logprobs=True,

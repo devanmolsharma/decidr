@@ -114,6 +114,22 @@ def validate_row(row: dict, check_id_format: bool = True) -> None:
         json.dumps(state, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as e:
         raise DecisionError("state must be finite JSON-compatible data") from e
+    if isinstance(state, list) and all(isinstance(b, dict) and "type" in b for b in state):
+        for block in state:
+            block_type = block["type"]
+            if block_type == "text":
+                if not isinstance(block.get("text"), str):
+                    raise DecisionError('a "text" content block needs a string "text" field')
+                continue
+            if block_type in ("image", "video", "audio"):
+                has_url = bool(block.get("url"))
+                has_data = bool(block.get("data"))
+                if has_url == has_data:
+                    raise DecisionError(
+                        f'a "{block_type}" content block needs exactly one of "url" or "data"'
+                    )
+                continue
+            raise DecisionError(f'unknown content block type "{block_type}"')
     options = row["options"]
     if not isinstance(options, list) or len(options) < 2:
         raise DecisionError("options must contain at least 2 entries")
