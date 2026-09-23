@@ -146,7 +146,7 @@ decision = client.decide(row)  # faster: warm connection, and (if warmup ran
 
 `warmup` never changes what `decide()` returns — every speculative guess it seeds is still verified against the real response before being trusted (see [docs/PREFIX_MATCHING.md](docs/PREFIX_MATCHING.md)). It only changes how fast the answer arrives. `Client`'s `cache` option controls the underlying speculative cache (on by default, persisted to `~/.decidr/token-cache.json`) — pass `cache=False` to disable it.
 
-Independent requests within one round, and independent hierarchy branches, are sent concurrently (a shared, bounded thread pool — `Client(..., max_workers=16)` to tune it), not one at a time.
+Independent requests within one round, independent hierarchy branches, and separate rows passed to `Client.decide_all(rows)` are all sent concurrently on a shared, bounded thread pool (`Client(..., max_workers=16)` to tune it), not one at a time — `decide_all`'s wall-clock cost for N rows lands close to one row's latency rather than N times it.
 
 ## Reading a `Decision`
 

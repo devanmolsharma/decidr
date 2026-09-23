@@ -220,7 +220,16 @@ class Client:
         return self._decide_tree(row)
 
     def decide_all(self, rows: list[dict]) -> list[Decision]:
-        return [self.decide(row) for row in rows]
+        """Runs every row's `decide()` concurrently on the shared pool
+        rather than one at a time. Each row is still its own independent
+        request (or tree of requests) -- there's no way to bundle
+        multiple rows into one call on the wire -- but nothing stops
+        those requests from being in flight at once, and providers don't
+        serialize independent requests against each other. This collapses
+        `decide_all`'s wall-clock cost from roughly N times one request's
+        latency down to close to one request's latency, bounded by the
+        pool's `max_workers`."""
+        return self._map(self.decide, rows)
 
     def score(self, row: dict) -> dict:
         """Grade `state` against an ordered rubric (`row["levels"]`, low
