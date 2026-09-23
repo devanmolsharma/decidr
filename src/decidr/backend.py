@@ -1,102 +1,99 @@
-"""How `Client` talks to a model provider.
+"""How `Client` talks to a model provider. See docs/SPEC.md §3 for the
+normative `Backend` contract (shared with the TypeScript port).
 
-`OllamaBackend` is the only one built in and needs nothing beyond the
-standard library -- it's what every example and test in this project uses.
-`LiteLLMBackend` is optional (`pip install decidr[litellm]`) and routes the
-same calls through LiteLLM (https://github.com/BerriAI/litellm), which
-understands 100+ providers -- OpenAI, Bedrock, hosted vLLM, and Ollama
-itself (though not for logprobs -- see below) -- behind one call, so decidr
-can run against a hosted model without decidr itself depending on LiteLLM
-by default. Anthropic (Claude) is a provider LiteLLM reaches but decidr
-still can't use through it: Claude's API has no `logprobs` field on any
-route, checked directly against Anthropic's own docs, not assumed -- see
-docs/PROVIDERS.md.
-
-Both implement the same one-method contract: given the messages for one
-race, return the model's reply and its logprobs at that position, in one
-normalized shape (see `Backend.chat`'s docstring). Every other part of this
-package -- prefix matching, the id hierarchy, calibration -- works purely in
-terms of that shape and never knows which backend produced it.
+`OpenAIBackend`, built on the official `openai` PyPI package, is the
+single backend -- and it's enough. It works against any
+OpenAI-compatible `/v1/chat/completions` endpoint: OpenAI itself,
+Ollama's own OpenAI-compatible endpoint (verified live to return real,
+correct logprobs), and other OpenAI-compatible hosts confirmed to
+forward logprobs correctly (see docs/PROVIDERS.md). There is
+deliberately no separate Ollama-specific backend or multi-provider
+abstraction layer -- SPEC.md §3.2 has the full researched reasoning for
+why a general-purpose multi-provider client (LiteLLM, OpenRouter, and
+others) has a silent or structural logprobs gap for at least one major
+provider, and MUST NOT be relied on for the core path.
 """
 
 from __future__ import annotations
 
-import json
-import urllib.error
-import urllib.request
-
 
 class DecisionError(ValueError):
-    """Bad row, or a backend that could not answer it. Defined here (not in
-    core.py) because backends need to raise it and core.py imports backends,
-    not the other way round; core.py re-exports this same class rather than
-    defining a second one, so `except DecisionError` anywhere in this
-    package catches every source of it."""
+    """Bad row, or a backend that could not answer it. Defined here (not
+    in core.py) because backends need to raise it and core.py imports
+    backends, not the other way round."""
 
 
 class Backend:
-    """Base class for talking to a model provider. Subclass and implement
-    `chat`; `Client` calls nothing else on a backend."""
+    """Base class for talking to a model provider. Subclass and
+    implement `chat`; `warmup`/`discover_tokens_batch` have default
+    implementations built purely on `chat` (see below) that a subclass
+    may override with something cheaper if its provider offers one."""
 
-    def chat(self, model: str, messages: list[dict]) -> dict:
-        """Send `messages`, predicting exactly one token (temperature 0),
-        and return:
+    def chat(self, model: str, messages: list[dict], max_tokens: int = 1) -> dict:
+        """Send `messages`, predicting `max_tokens` tokens (usually just
+        1) at temperature 0, and return:
 
-            {"content": str | None,        # the model's own reply, if any
+            {"content": str | None,
              "logprobs": [{"token": str, "logprob": float,
                             "top_logprobs": [{"token": str, "logprob": float}, ...]}]}
 
         `logprobs` has zero entries if the provider returned no logprob
-        information for this call at all (not the same as an empty
-        `top_logprobs` list inside a real entry) -- core.py treats a truly
-        empty list as "the server didn't support this," and surfaces a clear
-        error rather than guessing at a decision with no numbers behind it.
+        information for this call at all -- treated as a hard error by
+        `Client`, never guessed at.
         """
         raise NotImplementedError
 
+    def warmup(self, model: str) -> None:
+        """Pre-establish the connection before a latency-sensitive
+        `decide()` call. Default: one throwaway `chat` call."""
+        self.chat(model, [{"role": "user", "content": "."}])
 
-def _to_ollama_message(message: dict) -> dict:
-    """Ollama's `/api/chat` puts text in `content` and takes images
-    separately, as a per-message `images: list[str]` of raw base64 (no
-    `data:` prefix, no URLs). It has no video/audio input at all -- those
-    raise, so decidr never silently drops input the model didn't see."""
-    content = message["content"]
-    if isinstance(content, str):
-        return message
-    text_parts: list[str] = []
-    images: list[str] = []
-    for block in content:
-        block_type = block["type"]
-        if block_type == "text":
-            text_parts.append(block["text"])
-        elif block_type == "image":
-            if not block.get("data"):
-                raise DecisionError(
-                    "OllamaBackend needs inline \"data\" (base64) for an \"image\" block, not a "
-                    "\"url\" -- Ollama has no way to fetch a remote URL itself"
-                )
-            images.append(block["data"])
-        else:
-            raise DecisionError(
-                f'OllamaBackend cannot send a "{block_type}" content block -- Ollama\'s chat API '
-                f"has no {block_type} input"
-            )
-    out = {**message, "content": "".join(text_parts)}
-    if images:
-        out["images"] = images
-    return out
+    def discover_tokens_batch(self, model: str, words: list[str]) -> dict[str, list[str]]:
+        """Discover the real token boundaries of several option ids in
+        one request. See docs/SPEC.md §8 for the normative algorithm."""
+        unique = list(dict.fromkeys(words))
+        result: dict[str, list[str]] = {}
+        if not unique:
+            return result
+
+        prompt = f"List these {len(unique)} words, one per line, exactly as given, nothing else:\n" + "\n".join(unique)
+        max_tokens = sum(len(w) for w in unique) + len(unique) * 4 + 8
+        resp = self.chat(model, [{"role": "user", "content": prompt}], max_tokens)
+        entries = resp.get("logprobs") or []
+
+        word_index = 0
+        consumed = ""
+        tokens: list[str] = []
+        for entry in entries:
+            if word_index >= len(unique):
+                break
+            target = unique[word_index]
+            token = entry["token"]
+            remaining = target[len(consumed):]
+            if remaining and token and remaining.startswith(token):
+                tokens.append(token)
+                consumed += token
+                if consumed == target:
+                    result[target] = tokens
+                    word_index += 1
+                    consumed = ""
+                    tokens = []
+                continue
+            if tokens:
+                word_index += 1
+                consumed = ""
+                tokens = []
+        return result
 
 
-def _to_openai_message(message: dict) -> dict:
-    """LiteLLM forwards OpenAI-shaped `content` straight through for
-    providers that support it: an array of typed parts,
-    `{"type": "text", "text": ...}` and
-    `{"type": "image_url", "image_url": {"url": ...}}`, where `url` may be a
+def _to_openai_content(content: object) -> object:
+    """OpenAI's `/v1/chat/completions` takes an array of typed parts for
+    multimodal content -- `{"type": "text", "text": ...}` and
+    `{"type": "image_url", "image_url": {"url": ...}}`, where `url` is a
     normal http(s) link or a `data:` URI. No video/audio input on this
-    shape -- those raise."""
-    content = message["content"]
+    endpoint -- a block of either type raises."""
     if isinstance(content, str):
-        return message
+        return content
     parts: list[dict] = []
     for block in content:
         block_type = block["type"]
@@ -113,119 +110,108 @@ def _to_openai_message(message: dict) -> dict:
             parts.append({"type": "image_url", "image_url": {"url": url}})
         else:
             raise DecisionError(
-                f'LiteLLMBackend cannot send a "{block_type}" content block -- the chat '
-                f"completions shape has no {block_type} input"
+                f'cannot send a "{block_type}" content block -- the chat completions endpoint '
+                f"has no {block_type} input"
             )
-    return {**message, "content": parts}
+    return parts
 
 
-class OllamaBackend(Backend):
-    """Talks to one Ollama server's `/api/chat`. decidr's only
-    dependency-free path -- `urllib` from the standard library, nothing else.
+def _to_openai_message(message: dict) -> dict:
+    return {**message, "content": _to_openai_content(message["content"])}
+
+
+class OpenAIBackend(Backend):
+    """Talks to any OpenAI-compatible `/v1/chat/completions` endpoint --
+    OpenAI itself, Ollama's compat endpoint, or a self-hosted/third-party
+    host speaking the same wire format. Built on the official `openai`
+    PyPI package (see this module's docstring for why, and why there's
+    no separate hand-rolled HTTP path or Ollama-specific backend).
+
+    **Only some models support `logprobs`.** Most consistently absent
+    from reasoning-focused models (OpenAI's o-series and similar
+    elsewhere), present on standard chat models. Some otherwise
+    OpenAI-compatible hosts reject `logprobs` outright (Groq returns an
+    explicit 400) -- see docs/PROVIDERS.md for the current checked list.
     """
 
-    # Ollama's own cap on this field, checked directly against its source
-    # rather than assumed (server/routes.go enforces `> 20` at four call
-    # sites, before either of its own backends ever see the request).
     TOP_LOGPROBS = 20
 
-    def __init__(self, host: str = "http://127.0.0.1:11434", timeout: float = 120.0):
-        self.host = host.rstrip("/")
-        self.timeout = timeout
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str = "https://api.openai.com/v1",
+        timeout: float = 120.0,
+    ):
+        try:
+            import openai
+        except ImportError as e:
+            raise ImportError("OpenAIBackend needs the openai package: pip install decidr") from e
+        # Ollama's OpenAI-compatible endpoint ignores the key entirely but
+        # the SDK requires a non-empty string.
+        self._client = openai.OpenAI(api_key=api_key or "ollama", base_url=base_url, timeout=timeout)
+        self._openai = openai
+        # Some providers (Ollama's OpenAI-compatible endpoint, notably)
+        # run a reasoning/thinking preamble by default, which consumes
+        # the single requested token on thinking output instead of the
+        # real answer -- silently breaking this mechanism with no error.
+        # Sending reasoning_effort="none" disables that on providers
+        # that support it. Real OpenAI HARD REJECTS that same field for
+        # models with no reasoning mode to disable (400, not a silent
+        # ignore). There's no reliable way to know in advance which
+        # behavior a given (model, provider) pairing has, so this is
+        # detected once per backend instance and remembered.
+        self._sends_reasoning_effort: bool | None = None
 
-    def chat(self, model: str, messages: list[dict]) -> dict:
+    def chat(self, model: str, messages: list[dict], max_tokens: int = 1) -> dict:
         body = {
             "model": model,
-            "messages": [_to_ollama_message(m) for m in messages],
-            "stream": False,
-            # A reasoning preamble would put thinking tokens in the answer
-            # slot, so the very next token stops being the decision.
-            "think": False,
-            "options": {"num_predict": 1, "temperature": 0},
+            "messages": [_to_openai_message(m) for m in messages],
+            "max_tokens": max_tokens,
+            "temperature": 0,
             "logprobs": True,
             "top_logprobs": self.TOP_LOGPROBS,
         }
-        resp = self._post("/api/chat", body)
-        return {
-            "content": (resp.get("message") or {}).get("content"),
-            "logprobs": resp.get("logprobs") or [],  # already this exact shape
-        }
-
-    def _post(self, path: str, body: dict) -> dict:
-        req = urllib.request.Request(
-            f"{self.host}{path}",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"},
-        )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                return json.loads(resp.read())
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode(errors="replace")
-            try:
-                detail = json.loads(detail).get("error", detail)
-            except json.JSONDecodeError:
-                pass
-            raise DecisionError(f"{path} failed ({e.code}): {detail}") from e
-        except urllib.error.URLError as e:
-            raise DecisionError(f"cannot reach Ollama at {self.host}: {e.reason}") from e
+            if self._sends_reasoning_effort is not False:
+                try:
+                    response = self._client.chat.completions.create(**body, reasoning_effort="none")
+                    self._sends_reasoning_effort = True
+                except Exception as e:
+                    if self._is_unrecognized_argument_error(e, "reasoning_effort"):
+                        self._sends_reasoning_effort = False
+                        response = self._client.chat.completions.create(**body)
+                    else:
+                        raise
+            else:
+                response = self._client.chat.completions.create(**body)
+        except Exception as e:
+            raise DecisionError(f"chat completion failed: {e}") from e
 
-
-class LiteLLMBackend(Backend):
-    """Routes through LiteLLM instead of talking to Ollama directly, so
-    `Client` can run against any provider LiteLLM supports that actually
-    returns `logprobs`: OpenAI, Bedrock, a hosted vLLM endpoint, or Ollama
-    itself under a different name. Not installed by default --
-    `pip install decidr[litellm]`.
-
-    Anthropic (Claude) is reachable through LiteLLM but not usable here:
-    Claude's API has no `logprobs` field on any route (native Messages API
-    or Anthropic's own OpenAI-compatible endpoint), so this backend can't
-    get anything to score from it regardless of how the call is routed --
-    see docs/PROVIDERS.md.
-
-    LiteLLM's own top_logprobs ceiling varies by provider; this backend
-    doesn't try to raise or detect it, since decidr's per-level branching
-    (`MAX_BRANCHES_PER_LEVEL` in core.py) already keeps each individual race
-    small regardless of what a provider allows.
-
-    Any keyword LiteLLM's own `completion()` accepts (`api_key`, `api_base`,
-    a routed model name like `"gpt-4o-mini"` or `"bedrock/meta.llama3-1-8b..."`)
-    can be passed here and is forwarded on every call.
-    """
-
-    def __init__(self, **litellm_kwargs):
-        try:
-            import litellm
-        except ImportError as e:
-            raise ImportError(
-                "LiteLLMBackend needs the optional litellm package: pip install decidr[litellm]"
-            ) from e
-        self._litellm = litellm
-        self._kwargs = litellm_kwargs
-
-    def chat(self, model: str, messages: list[dict]) -> dict:
-        resp = self._litellm.completion(
-            model=model,
-            messages=[_to_openai_message(m) for m in messages],
-            max_tokens=1,
-            temperature=0,
-            logprobs=True,
-            top_logprobs=20,
-            **self._kwargs,
-        )
-        choice = resp.choices[0]
-        content = getattr(choice.message, "content", None)
+        choice = response.choices[0] if response.choices else None
         entries: list[dict] = []
-        lp = getattr(choice, "logprobs", None)
+        lp = getattr(choice, "logprobs", None) if choice else None
         content_list = getattr(lp, "content", None) if lp else None
         if content_list:
-            first = content_list[0]
-            entries = [{
-                "token": first.token,
-                "logprob": first.logprob,
-                "top_logprobs": [
-                    {"token": t.token, "logprob": t.logprob} for t in (first.top_logprobs or [])
-                ],
-            }]
-        return {"content": content, "logprobs": entries}
+            entries = [
+                {
+                    "token": entry.token,
+                    "logprob": entry.logprob,
+                    "top_logprobs": [{"token": t.token, "logprob": t.logprob} for t in (entry.top_logprobs or [])],
+                }
+                for entry in content_list
+            ]
+        return {
+            "content": getattr(choice.message, "content", None) if choice else None,
+            "logprobs": entries,
+        }
+
+    def _is_unrecognized_argument_error(self, error: Exception, param_name: str) -> bool:
+        """Whether `error` is specifically the provider's "unrecognized
+        request argument" rejection for `param_name` -- a 400 with that
+        exact message shape. Used to detect (once) that this provider
+        doesn't support `reasoning_effort`, distinct from any other
+        request failure, which should still propagate."""
+        status = getattr(error, "status_code", None) or getattr(error, "status", None)
+        if status != 400:
+            return False
+        return param_name in str(error)

@@ -4,24 +4,23 @@ build-backend = "hatchling.build"
 
 [project]
 name = "decidr"
-version = "0.7.1"
-description = "Typed decisions from an LLM in one forward pass, local via Ollama or hosted via LiteLLM"
+version = "0.8.0"
+description = "Typed decisions from an LLM in one forward pass -- OpenAI, Ollama, or any OpenAI-compatible endpoint"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["llm", "ollama", "litellm", "classification", "routing", "logprobs", "decisions"]
+keywords = ["llm", "openai", "ollama", "classification", "routing", "logprobs", "decisions"]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
   "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-dependencies = []
+dependencies = ["openai>=1.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
-litellm = ["litellm>=1.0"]
 
 [project.urls]
 Homepage = "https://github.com/devanmolsharma/decidr"

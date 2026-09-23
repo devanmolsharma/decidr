@@ -7,7 +7,7 @@ one forward pass each, against whatever model you already have in Ollama.
 import sys
 import time
 
-from decidr import Client, DecisionError
+from decidr import DecisionError, Client, confidence, is_reliable
 
 ROWS = [
     {
@@ -45,30 +45,24 @@ ROWS = [
 
 def main() -> int:
     model = sys.argv[1] if len(sys.argv) > 1 else "qwen3.5:4b"
-    host = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:11434"
+    host = sys.argv[2] if len(sys.argv) > 2 else "http://127.0.0.1:11434/v1"
 
-    client = Client(model=model, host=host)
-    try:
-        mode = "exact" if client.supports_exact() else "ranked"
-    except DecisionError as e:
-        print(f"could not reach Ollama: {e}")
-        return 1
+    with Client(model, host=host) as client:
+        print(f"model={model}\n")
+        for row in ROWS:
+            started = time.perf_counter()
+            try:
+                d = client.decide(row)
+            except DecisionError as e:
+                print(f"{row['id']:10s} error: {e}")
+                continue
+            ms = round((time.perf_counter() - started) * 1000)
 
-    print(f"model={model}  mode={mode}\n")
-    for row in ROWS:
-        started = time.perf_counter()
-        try:
-            d = client.decide(row)
-        except DecisionError as e:
-            print(f"{row['id']:10s} error: {e}")
-            continue
-        ms = round((time.perf_counter() - started) * 1000)
-
-        ranked = sorted(d.probabilities.items(), key=lambda kv: -kv[1])
-        spread = "  ".join(f"{k}={v:.3f}" for k, v in ranked)
-        print(f"{row['id']:10s} {d.choice:13s} {d.confidence:6.1%}  {ms:5d}ms   {spread}")
-        if not d.is_reliable():
-            print(f"{'':10s} unscored (outside the top-20 window): {d.unscored}")
+            ranked = sorted(d.probabilities.items(), key=lambda kv: -kv[1])
+            spread = "  ".join(f"{k}={v:.3f}" for k, v in ranked)
+            print(f"{row['id']:10s} {d.choice:13s} {confidence(d):6.1%}  {ms:5d}ms   {spread}")
+            if not is_reliable(d):
+                print(f"{'':10s} unscored (outside the top-20 window): {d.unscored}")
     return 0
 
 

@@ -1,35 +1,11 @@
-"""Typed semantic decisions against any local Ollama model, in one forward pass.
+"""`Client`: give it a row, get back a `Decision` with real probabilities
+over real option ids. See docs/SPEC.md §4-§6 for the normative behavior
+this file implements (shared with the TypeScript port).
 
-Send state + question + options, get probabilities back. No answer sentence, no
-JSON to repair, no decoding loop -- the answer is read out of the option tokens'
-log probabilities at a single position.
-
-Rows use the same shape other single-pass decision engines accept, so they port
-between implementations:
-
-    {"id": "route-1",
-     "state": "Customer cannot access an account after a password reset.",
-     "question": "Which queue should handle this request?",
-     "options": [{"id": "access",  "description": "Account access support."},
-                 {"id": "billing", "description": "Billing support."}]}
-
-Option ids are scored by their own text -- real ids like "billing" or
-"access_denied", never a stand-in letter -- read out of the model's own
-logits, one real token at a time (see prefix.py's module docstring for the
-matching mechanism, docs/HIERARCHY.md for how ids above a handful of
-options are resolved via a hierarchy instead of one flat race).
-
-Scores are read from `top_logprobs`, which is a rank window (Ollama's own
-cap of 20), not a requested set: a candidate that doesn't rank inside it is
-reported as unscored rather than guessed at, instead of being silently
-missing from `probabilities`. See docs/HIERARCHY.md for how large option
-sets are kept from hitting this in practice.
-
-`Client` talks to a model through a `Backend` (see backend.py):
-`OllamaBackend` by default, needing nothing beyond the standard library, or
-`LiteLLMBackend` for any other provider LiteLLM supports, as an optional
-extra. Nothing in this module knows or cares which one is in use -- both
-return the same normalized `{"content", "logprobs"}` shape.
+decidr reads a probability distribution over a closed set of typed
+answers directly from a chat model's next-token log-probabilities, in
+one or a small number of forward passes, instead of generating free
+text and parsing it.
 """
 
 from __future__ import annotations
@@ -37,79 +13,64 @@ from __future__ import annotations
 import json
 import math
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Literal
 
-from .backend import Backend, DecisionError, OllamaBackend
+from .backend import Backend, DecisionError, OpenAIBackend
 from .prefix import MAX_DEPTH, Candidate, build_prefix_messages, build_tree, group_by_context, match_step
+from .token_cache import TokenCache
 
-DEFAULT_HOST = "http://127.0.0.1:11434"
+DEFAULT_HOST = "http://127.0.0.1:11434/v1"
+
+MAX_ID_LENGTH = 40
+MIN_ID_LENGTH = 2
+ID_FORMAT = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
+MAX_BRANCHES_PER_LEVEL = 16
 
 
 @dataclass
 class Decision:
     id: str
-    choice: str                       # option id with the highest probability
-    probabilities: dict[str, float]   # option id -> probability, sums to 1 over scored options
-    logprobs: dict[str, float]        # option id -> raw logprob, before normalizing
-    mode: Literal["prefix"]           # how the scores were read; always "prefix" -- see module docstring
-    unscored: list[str] = field(default_factory=list)  # options the server could not report
-    eliminated: list[str] = field(default_factory=list)  # options under a hierarchy branch that lost a real race
-    raw_answer: str | None = None     # the model's own first reply
-
-    @property
-    def confidence(self) -> float:
-        return self.probabilities.get(self.choice, 0.0)
-
-    def is_reliable(self) -> bool:
-        """False when some option went unscored, so the distribution is incomplete
-        and `probabilities` is normalized over a subset of what was asked.
-
-        Not affected by `eliminated`: an option under a hierarchy branch that
-        lost a real, fair race against its sibling branches is not a
-        measurement gap, it's the mechanism correctly ruling it out. See
-        docs/HIERARCHY.md."""
-        return not self.unscored
+    choice: str
+    probabilities: dict[str, float]
+    logprobs: dict[str, float]
+    mode: Literal["prefix"]
+    unscored: list[str] = field(default_factory=list)
+    eliminated: list[str] = field(default_factory=list)
+    stopped_early: list[str] = field(default_factory=list)
+    raw_answer: str | None = None
 
 
-# Above this, an id costs more disambiguation rounds than MAX_DEPTH allows in
-# the worst case (heavy subword fragmentation -- numbers, punctuation, and
-# rare words often split into many short pieces), and would land in
-# `unscored` for a reason that had nothing to do with whether it was the
-# right answer. See docs/NAMING_IDS.md.
-MAX_ID_LENGTH = 40
+def confidence(decision: Decision) -> float:
+    """`decision.probabilities.get(decision.choice, 0.0)`, or 0 if
+    `choice` somehow isn't a key (shouldn't happen -- `choice` is always
+    the argmax of `probabilities`). A function, not a method, since
+    `Decision` is a plain data shape."""
+    return decision.probabilities.get(decision.choice, 0.0)
 
-# Segments of lowercase letters/digits, joined by single underscores. This is
-# the opinionated format prefix mode requires: it's what lets an id double as
-# a hierarchy path ("billing_refund" -> level 1 "billing", level 2 "refund")
-# for options above ID_SEGMENT_LIMIT. No leading/trailing/double underscores,
-# no other punctuation -- those would make segment boundaries ambiguous.
-# See docs/NAMING_IDS.md.
-ID_FORMAT = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
 
-# Above this many distinct branches at one hierarchy level, that level itself
-# needs the same treatment the old flat cap existed for: too many things
-# racing at once for top_logprobs's window to see them all -- see
-# docs/HIERARCHY.md.
-MAX_BRANCHES_PER_LEVEL = 16
+def is_reliable(decision: Decision) -> bool:
+    """`False` when `unscored` is non-empty, meaning `probabilities` is
+    missing real measurements for at least one option. Deliberately
+    unaffected by `eliminated`/`stopped_early` -- see docs/HIERARCHY.md
+    and docs/PREFIX_MATCHING.md for why those aren't measurement gaps."""
+    return not decision.unscored
 
 
 def validate_row(row: dict, check_id_format: bool = True) -> None:
-    """Reject a malformed row up front, with a message naming what's wrong --
-    a bad row should fail here, not produce a confident-looking wrong answer.
-    `check_id_format` defaults on; `decide()` always calls with it on for a
-    caller's own row. Sub-races `_decide_tree` builds internally (segment
-    values, not real option ids) go straight to `_decide_prefix` and never
-    pass through this check at all, format rules only ever apply to what a
-    caller actually supplies."""
+    """Reject a malformed row up front, with a message naming what's
+    wrong -- a bad row should fail here, not produce a confident-looking
+    wrong answer."""
     required = {"id", "state", "question", "options"}
     if not required <= row.keys():
         raise DecisionError(f"row is missing fields: {sorted(required - row.keys())}")
     if not all(isinstance(row[k], str) and row[k] for k in ("id", "question")):
         raise DecisionError("id and question must be nonempty strings")
+
     state = row["state"]
-    if not isinstance(state, (str, dict, list)) or not state:
-        raise DecisionError("state must be a nonempty string, object, or array")
+    if not isinstance(state, (str, dict, list)):
+        raise DecisionError("state must be a string, object, or array")
     try:
         json.dumps(state, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as e:
@@ -125,11 +86,10 @@ def validate_row(row: dict, check_id_format: bool = True) -> None:
                 has_url = bool(block.get("url"))
                 has_data = bool(block.get("data"))
                 if has_url == has_data:
-                    raise DecisionError(
-                        f'a "{block_type}" content block needs exactly one of "url" or "data"'
-                    )
+                    raise DecisionError(f'a "{block_type}" content block needs exactly one of "url" or "data"')
                 continue
             raise DecisionError(f'unknown content block type "{block_type}"')
+
     options = row["options"]
     if not isinstance(options, list) or len(options) < 2:
         raise DecisionError("options must contain at least 2 entries")
@@ -140,45 +100,35 @@ def validate_row(row: dict, check_id_format: bool = True) -> None:
         ids.append(opt["id"])
     if len(ids) != len(set(ids)):
         raise DecisionError("option ids must be unique")
+
     if check_id_format:
         too_long = [i for i in ids if len(i) > MAX_ID_LENGTH]
         if too_long:
+            raise DecisionError(f"option id(s) too long: {too_long!r} (max {MAX_ID_LENGTH} chars). See docs/NAMING_IDS.md.")
+        too_short = [i for i in ids if len(i) < MIN_ID_LENGTH]
+        if too_short:
             raise DecisionError(
-                f"option id(s) too long: {too_long!r} (max {MAX_ID_LENGTH} chars). A long id "
-                "needs more disambiguation rounds than MAX_DEPTH allows and can land in "
-                "`unscored` for a reason unrelated to whether it was the right answer -- "
-                "shorten it and put the full name in that option's description instead. "
-                "See docs/NAMING_IDS.md."
+                f"option id(s) shorter than {MIN_ID_LENGTH} characters: {too_short!r} -- a single "
+                "character is too likely to collide with another option's first token or a common "
+                "filler token in the race. See docs/NAMING_IDS.md."
             )
         badly_shaped = [i for i in ids if not ID_FORMAT.match(i)]
         if badly_shaped:
             raise DecisionError(
-                f"option id(s) don't match the required format: {badly_shaped!r}. "
-                "Ids must be lowercase letters/digits in underscore-separated segments "
-                "(e.g. \"billing_refund\"), with no leading, trailing, or doubled underscores "
-                "and no other punctuation. This is what lets an id double as a hierarchy path "
-                "for large option sets -- see docs/NAMING_IDS.md."
+                f"option id(s) don't match the required format: {badly_shaped!r}. Ids must be "
+                "lowercase letters/digits in underscore-separated segments. See docs/NAMING_IDS.md."
             )
-        # "billing" and "billing_refund" together are ambiguous: is "billing"
-        # a standalone answer, or the umbrella every other option nests
-        # under? Rather than guess, require ids that don't nest inside each
-        # other -- every id is either fully distinct from every other id's
-        # segments, or one continues past where another one ends, never both.
         segments = {i: i.split("_") for i in ids}
         for a, a_segs in segments.items():
             for b, b_segs in segments.items():
-                if a != b and b_segs[:len(a_segs)] == a_segs:
+                if a != b and b_segs[: len(a_segs)] == a_segs:
                     raise DecisionError(
-                        f"option id {a!r} is a prefix of {b!r} -- ambiguous as a hierarchy path "
-                        f"(is {a!r} its own answer, or does everything under it belong to {b!r}?). "
-                        "Give the shorter one a more specific id, or add a sibling under it "
-                        "instead of leaving it as a leaf itself. See docs/NAMING_IDS.md."
+                        f"option id {a!r} is a prefix of {b!r} -- ambiguous as a hierarchy path. "
+                        "See docs/NAMING_IDS.md."
                     )
 
 
 def softmax(logprobs: list[float], temperature: float = 1.0) -> list[float]:
-    """Normalize over the supplied options only. The result is conditional on
-    this option set -- it says nothing about tokens outside it."""
     if not logprobs:
         return []
     scaled = [lp / temperature for lp in logprobs]
@@ -188,135 +138,286 @@ def softmax(logprobs: list[float], temperature: float = 1.0) -> list[float]:
     return [v / total for v in exp] if total else [1.0 / len(exp)] * len(exp)
 
 
-class Client:
-    """Talks to a model through a `Backend` -- `OllamaBackend` by default."""
+def _found_tokens(entry: dict) -> dict[str, float]:
+    """{token: logprob} out of one response position's top_logprobs.
+    Tokens are used exactly as returned -- no stripping -- see
+    prefix.py's match_step docstring for why."""
+    found: dict[str, float] = {}
+    token = entry.get("token")
+    if token:
+        found[token] = entry.get("logprob", 0.0)
+    for alt in entry.get("top_logprobs", []):
+        found.setdefault(alt["token"], alt["logprob"])
+    return found
 
-    def __init__(self, model: str, host: str = DEFAULT_HOST, timeout: float = 120.0,
-                 temperature: float = 1.0, backend: Backend | None = None, exhaustive: bool = True):
+
+def _leaf_ids(node) -> list[str]:
+    if not node.children:
+        return [o["id"] for o in node.options]
+    ids: list[str] = []
+    for child in node.children.values():
+        ids.extend(_leaf_ids(child))
+    return ids
+
+
+class Client:
+    """Talks to a model through a `Backend` -- `OpenAIBackend` by
+    default, pointed at a local Ollama's OpenAI-compatible endpoint."""
+
+    def __init__(
+        self,
+        model: str,
+        host: str = DEFAULT_HOST,
+        timeout: float = 120.0,
+        temperature: float = 1.0,
+        backend: Backend | None = None,
+        exhaustive: bool = True,
+        cache: TokenCache | bool = True,
+        max_workers: int = 16,
+    ):
         self.model = model
         self.temperature = temperature
-        self.backend = backend if backend is not None else OllamaBackend(host=host, timeout=timeout)
-        # Explore every hierarchy branch (real probabilities for every
-        # option, more requests) instead of only the winning path
-        # (fewer requests, losing branches with unexplored children go to
-        # `eliminated` instead of getting a real number). See docs/HIERARCHY.md.
+        self.backend = backend if backend is not None else OpenAIBackend(base_url=host, timeout=timeout)
         self.exhaustive = exhaustive
+        if cache is False:
+            self._cache: TokenCache | None = None
+        elif isinstance(cache, TokenCache):
+            self._cache = cache
+        else:
+            self._cache = TokenCache()
+        # One bounded, shared pool for the whole client's lifetime --
+        # never one ThreadPoolExecutor per round or per hierarchy node,
+        # which would create unbounded (and, across recursive branches,
+        # compounding) thread counts. See docs/SPEC.md §11.1: independent
+        # requests within one round, and independent hierarchy branches,
+        # MUST be sent concurrently, never sequentially.
+        self._pool = ThreadPoolExecutor(max_workers=max_workers)
 
-    # ---- transport ---------------------------------------------------------
+    def close(self) -> None:
+        self._pool.shutdown(wait=False)
 
-    def _chat(self, messages: list[dict]) -> dict:
-        return self.backend.chat(self.model, messages)
+    def __enter__(self) -> "Client":
+        return self
 
-    @staticmethod
-    def _found_tokens(entry: dict) -> dict[str, float]:
-        """{token: logprob} out of one response position's top_logprobs, which
-        is a rank window, not a requested set -- a token can be common enough
-        to matter and still miss it."""
-        found: dict[str, float] = {}
-        if entry.get("token"):
-            found[entry["token"].strip()] = entry.get("logprob", 0.0)
-        for alt in entry.get("top_logprobs", []):
-            found.setdefault(alt["token"].strip(), alt["logprob"])
-        return found
+    def __exit__(self, *exc_info) -> None:
+        self.close()
 
-    # ---- decisions ---------------------------------------------------------
+    def _chat(self, messages: list[dict], max_tokens: int = 1) -> dict:
+        return self.backend.chat(self.model, messages, max_tokens)
+
+    def _map(self, fn, items: list) -> list:
+        """Run `fn` over `items` concurrently on the shared pool. A
+        single item runs inline -- no thread-pool overhead for the
+        common one-request case."""
+        if len(items) <= 1:
+            return [fn(item) for item in items]
+        return list(self._pool.map(fn, items))
+
+    # ---- decisions ----------------------------------------------------
 
     def decide(self, row: dict) -> Decision:
         validate_row(row, check_id_format=True)
         return self._decide_tree(row)
 
-    def _decide_prefix(self, row: dict) -> Decision:
-        """Score each option by walking its own id text, one real token at a
-        time, discovered from what the model actually returns rather than a
-        precomputed tokenizer (there is no way to get one for an arbitrary
-        Ollama model over the API -- see prefix.py's module docstring).
+    def decide_all(self, rows: list[dict]) -> list[Decision]:
+        return [self.decide(row) for row in rows]
 
-        Every option is walked to the end of its own id, even once it no
-        longer shares a prefix with anything else, so every final score is
-        a genuine P(full id | prompt), not a truncated one that would look
-        artificially more likely just for being short.
+    def score(self, row: dict) -> dict:
+        """Grade `state` against an ordered rubric (`row["levels"]`, low
+        to high) -- comparable to TypeSafe's `Score` primitive.
+        Implemented entirely on top of `decide()`: each level becomes an
+        ordinary option, and `score` is the probability-weighted level
+        index (`sum(index * probability)`), which can land between two
+        integers when the model's distribution spans more than one
+        level.
+
+        Returns `{"id": row["id"], "score": float, "decision": Decision}`.
         """
+        levels = row["levels"]
+        if not isinstance(levels, list) or len(levels) < 2:
+            raise DecisionError("row['levels'] must be a list with at least 2 entries")
+        decision = self.decide(
+            {
+                "id": row["id"],
+                "state": row["state"],
+                "question": row["question"],
+                "options": [{"id": lvl["id"], "description": lvl["description"]} for lvl in levels],
+            }
+        )
+        index_by_id = {lvl["id"]: i for i, lvl in enumerate(levels)}
+        score = sum(index_by_id[opt_id] * p for opt_id, p in decision.probabilities.items() if opt_id in index_by_id)
+        return {"id": row["id"], "score": score, "decision": decision}
+
+    def truth(self, row: dict) -> dict:
+        """Is `row["question"]` true of `row["state"]`? Comparable to
+        TypeSafe's `Noun` primitive. A fixed two-option `decide()`
+        between "true" and "false" -- the probability itself is the
+        useful signal, not just which side of 0.5 it falls on.
+
+        Returns `{"id": row["id"], "truth": float, "decision": Decision}`.
+        """
+        decision = self.decide(
+            {
+                "id": row["id"],
+                "state": row["state"],
+                "question": row["question"],
+                "options": [
+                    {"id": "true", "description": "The statement is true."},
+                    {"id": "false", "description": "The statement is false."},
+                ],
+            }
+        )
+        return {"id": row["id"], "truth": decision.probabilities.get("true", 0.0), "decision": decision}
+
+    def warmup(self, row: dict) -> Decision:
+        """Discover this row's options' real token boundaries up front
+        (one batched request for everything not already cached), seed
+        the speculative cache, then run `decide()`. See docs/SPEC.md
+        §9.4."""
+        if self._cache is not None:
+            uncached = [o["id"] for o in row["options"] if self._cache.get(self.model, o["id"]) is None]
+            if uncached:
+                try:
+                    discovered = self.backend.discover_tokens_batch(self.model, uncached)
+                    for option_id, tokens in discovered.items():
+                        if tokens:
+                            self._cache.set(self.model, option_id, tokens)
+                except Exception:
+                    # Discovery is a pure optimization -- decide() below
+                    # still works correctly without it.
+                    pass
+            self._cache.save()
+        else:
+            self.backend.warmup(self.model)
+        return self.decide(row)
+
+    def _decide_prefix(self, row: dict) -> Decision:
+        """Score each option by walking its own id text, one real token
+        at a time (see docs/PREFIX_MATCHING.md). Stops the moment a
+        candidate has no remaining competition for its current prefix
+        (SPEC.md §6.1 step 4 / §6.4) -- that candidate is scored on its
+        logprob_sum as accumulated so far rather than walked to the end
+        of its own id."""
         candidates = [Candidate(option_id=opt["id"], remaining=opt["id"]) for opt in row["options"]]
-        raw_answer = None
+        raw_answer: str | None = None
+        exceeded_depth = True
+
+        # Speculation (SPEC.md §9.3): gated one round at a time on real
+        # confirmation, never speculating past a round nothing has
+        # confirmed yet. `speculative` maps a not-yet-requested prefix to
+        # an already-in-flight future for it.
+        speculative: dict[str, object] = {}
+        confirmed_tokens: dict[str, list[str]] = {}
+
+        def fire(consumed: str):
+            return self._pool.submit(self._chat, build_prefix_messages(row, consumed))
 
         for depth in range(MAX_DEPTH):
             groups = group_by_context(candidates)
             if not groups:
+                exceeded_depth = False
                 break
-            for consumed, group in groups.items():
-                resp = self._chat(build_prefix_messages(row, prefix=consumed))
+
+            # Stop-early default: a group down to exactly one candidate
+            # has no remaining competition -- mark it and skip the request.
+            for consumed in list(groups):
+                group = groups[consumed]
+                if len(group) == 1:
+                    group[0].stopped_early = True
+                    del groups[consumed]
+            if not groups:
+                exceeded_depth = False
+                break
+
+            items = list(groups.items())
+            futures = [speculative.pop(consumed, None) or fire(consumed) for consumed, _ in items]
+            responses = [f.result() for f in futures]
+
+            for i, (consumed, group) in enumerate(items):
+                resp = responses[i]
                 entries = resp.get("logprobs") or []
                 if not entries:
                     for c in group:
                         c.unscored_reason = "server returned no logprobs for this step"
                     continue
-                if depth == 0 and raw_answer is None:
+                if depth == 0 and i == 0:
                     raw_answer = resp.get("content")
-                found = self._found_tokens(entries[0])
-                match_step(group, found)
-        else:
+
+                found = _found_tokens(entries[0])
+                for c in group:
+                    before = c.consumed
+                    match_step([c], found)
+                    if c.consumed == before:
+                        continue
+                    tokens = confirmed_tokens.setdefault(c.option_id, [])
+                    tokens.append(c.consumed[len(before):])
+
+                    if self._cache is None or c.done:
+                        continue
+                    predicted = self._cache.get(self.model, c.option_id)
+                    if not predicted:
+                        continue
+                    observed = confirmed_tokens[c.option_id]
+                    still_on_track = all(observed[idx] == predicted[idx] for idx in range(len(observed)))
+                    if not still_on_track or len(observed) >= len(predicted):
+                        continue
+                    next_token = predicted[len(observed)]
+                    next_prefix = c.consumed + next_token
+                    if next_prefix not in speculative:
+                        speculative[next_prefix] = fire(next_prefix)
+
+        if exceeded_depth:
             for c in candidates:
                 if not c.done:
                     c.unscored_reason = f"exceeded max disambiguation depth ({MAX_DEPTH})"
 
-        logprobs = {c.option_id: c.logprob_sum for c in candidates if c.remaining == ""}
-        unscored = [c.option_id for c in candidates if c.remaining != ""]
+        if self._cache is not None:
+            for c in candidates:
+                if c.unscored_reason is None and not c.stopped_early and c.remaining == "":
+                    tokens = confirmed_tokens.get(c.option_id)
+                    if tokens:
+                        self._cache.set(self.model, c.option_id, tokens)
+            self._cache.save()
+
+        logprobs: dict[str, float] = {}
+        unscored: list[str] = []
+        stopped_early: list[str] = []
+        for c in candidates:
+            if c.unscored_reason is None:
+                logprobs[c.option_id] = c.logprob_sum
+                if c.stopped_early:
+                    stopped_early.append(c.option_id)
+            else:
+                unscored.append(c.option_id)
 
         if not logprobs:
-            raise DecisionError(
-                f"row {row['id']!r}: none of the option ids could be fully resolved. "
-                f"reasons: {[(c.option_id, c.unscored_reason) for c in candidates]}"
-            )
+            reasons = "; ".join(f"{c.option_id}: {c.unscored_reason}" for c in candidates)
+            raise DecisionError(f"could not score any option: {reasons}")
 
         ids = list(logprobs)
         probs = softmax([logprobs[i] for i in ids], self.temperature)
         probabilities = dict(zip(ids, probs))
+        choice = max(probabilities, key=probabilities.get)
+
         return Decision(
-            id=row["id"],
-            choice=max(probabilities, key=probabilities.get),
+            id=row.get("id", ""),
+            choice=choice,
             probabilities=probabilities,
             logprobs=logprobs,
             mode="prefix",
             unscored=unscored,
+            stopped_early=stopped_early,
             raw_answer=raw_answer,
         )
 
     def _decide_tree(self, row: dict) -> Decision:
-        """Descend the id hierarchy (see docs/NAMING_IDS.md for the required
-        format, docs/HIERARCHY.md for the full mechanism) one level at a
-        time. A node with only one child needs no race -- the id already
-        committed to that branch. A node with several runs exactly one
-        `_decide_prefix` race over that level's distinct segment values, real
-        ids resolved by the same token-walking mechanism used everywhere
-        else in this mode, just applied to segment values instead of full
-        ids.
-
-        Whether a losing branch gets explored further depends on
-        `self.exhaustive` and how much it would cost:
-
-          - A losing branch that's already a single leaf is explored for
-            free regardless of `exhaustive` -- its probability comes
-            straight out of the race that already ran, no extra request.
-          - A losing branch with its own unexplored children costs a real
-            request to look inside. With `exhaustive=True` (the default),
-            every branch gets explored this way, so every option ends up
-            with a real, comparable probability. With `exhaustive=False`,
-            only the winning branch is explored past this point, and
-            everything else goes to `eliminated` -- fewer requests, but
-            those options' true probabilities were never measured.
-
-        A branch whose segment value never showed up in a race's results at
-        all goes to `unscored` regardless of `exhaustive`: that's a genuine
-        measurement gap, not a decision about how much to explore.
-
-        This degrades gracefully for flat (non-hierarchical) option sets:
-        an id with no underscores is a one-segment path, so the root's
-        children already are full ids, and this runs exactly one race,
-        identical to calling `_decide_prefix` directly.
-        """
+        """Descend the id hierarchy one level at a time (see
+        docs/HIERARCHY.md). Independent branches at one node are explored
+        concurrently on the shared pool (SPEC.md §11.1)."""
         probabilities: dict[str, float] = {}
         eliminated: list[str] = []
         unscored: list[str] = []
+        stopped_early: list[str] = []
         raw_answer_holder: list[str | None] = [None]
 
         def explore(node, path_logprob: float) -> None:
@@ -325,13 +426,11 @@ class Client:
                 return
             if len(node.children) > MAX_BRANCHES_PER_LEVEL:
                 raise DecisionError(
-                    f"row {row['id']!r}: {len(node.children)} distinct branches at hierarchy "
-                    f"level {node.segment!r} exceeds the {MAX_BRANCHES_PER_LEVEL} that can "
-                    "reliably race at once. Add another underscore-separated level to these "
-                    "ids to split the branching further. See docs/NAMING_IDS.md."
+                    f"level {node.segment or '(root)'!r} has {len(node.children)} branches, over the "
+                    f"limit of {MAX_BRANCHES_PER_LEVEL} -- add another id segment to split it further"
                 )
             if len(node.children) == 1:
-                [only_child] = node.children.values()  # only one branch possible -- descend for free
+                [only_child] = node.children.values()
                 explore(only_child, path_logprob)
                 return
 
@@ -348,23 +447,27 @@ class Client:
             if d.choice not in node.children:
                 raise DecisionError(f"row {row['id']!r}: internal error, chose an unknown branch {d.choice!r}")
 
+            to_explore: list[tuple] = []
             for seg, child in node.children.items():
                 if seg in d.unscored:
                     unscored.extend(o["id"] for o in child.options)
                     continue
+                if seg in d.stopped_early:
+                    stopped_early.extend(_leaf_ids(child))
                 branch_logprob = path_logprob + math.log(d.probabilities[seg])
-                if seg == d.choice or self.exhaustive or len(child.options) == 1:
-                    explore(child, branch_logprob)
+                is_winner = seg == d.choice
+                is_free_leaf = len(child.options) == 1
+                if is_winner or self.exhaustive or is_free_leaf:
+                    to_explore.append((child, branch_logprob))
                 else:
-                    # A losing branch with its own children we're choosing
-                    # not to pay for: which leaf inside it would have won,
-                    # or at what probability, was never measured.
                     eliminated.extend(o["id"] for o in child.options)
+
+            self._map(lambda args: explore(*args), to_explore)
 
         explore(build_tree(row["options"]), 0.0)
 
         if not probabilities:
-            raise DecisionError(f"row {row['id']!r}: none of the option ids could be resolved.")
+            raise DecisionError(f"row {row['id']!r}: could not score any option in the hierarchy")
 
         choice = max(probabilities, key=probabilities.get)
         return Decision(
@@ -375,8 +478,6 @@ class Client:
             mode="prefix",
             unscored=unscored,
             eliminated=eliminated,
+            stopped_early=stopped_early,
             raw_answer=raw_answer_holder[0],
         )
-
-    def decide_all(self, rows: list[dict]) -> list[Decision]:
-        return [self.decide(row) for row in rows]

@@ -1,23 +1,7 @@
-import json
-
 import pytest
 
-from decidr import Client, DecisionError, OllamaBackend, build_prefix_messages, validate_row
-from decidr.backend import _to_ollama_message, _to_openai_message
-
-
-class _FakeHTTPResponse:
-    def __init__(self, body: dict):
-        self._body = json.dumps(body).encode()
-
-    def read(self):
-        return self._body
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
+from decidr import Client, DecisionError, build_prefix_messages, validate_row
+from decidr.backend import Backend, _to_openai_message
 
 
 def _image_row(state):
@@ -67,28 +51,6 @@ def test_build_prefix_messages_keeps_content_block_state_as_a_list():
     assert "Answer with exactly one of: cat, dog." in user["content"][1]["text"]
 
 
-def test_to_ollama_message_moves_image_data_into_images_field():
-    message = {
-        "role": "user",
-        "content": [{"type": "text", "text": "what is this"}, {"type": "image", "data": "aGVsbG8="}],
-    }
-    out = _to_ollama_message(message)
-    assert out["content"] == "what is this"
-    assert out["images"] == ["aGVsbG8="]
-
-
-def test_to_ollama_message_raises_on_url_only_image():
-    message = {"role": "user", "content": [{"type": "image", "url": "https://x/y.png"}]}
-    with pytest.raises(DecisionError):
-        _to_ollama_message(message)
-
-
-def test_to_ollama_message_raises_on_video_block():
-    message = {"role": "user", "content": [{"type": "video", "data": "aGVsbG8="}]}
-    with pytest.raises(DecisionError):
-        _to_ollama_message(message)
-
-
 def test_to_openai_message_builds_typed_content_array():
     message = {
         "role": "user",
@@ -116,21 +78,29 @@ def test_to_openai_message_raises_on_video_block():
         _to_openai_message(message)
 
 
-def test_ollama_backend_sends_images_field_end_to_end(monkeypatch):
-    captured = {}
+def test_to_openai_message_raises_on_image_with_neither_url_nor_data():
+    message = {"role": "user", "content": [{"type": "image"}]}
+    with pytest.raises(DecisionError):
+        _to_openai_message(message)
 
-    def fake_urlopen(req, timeout):
-        captured["body"] = json.loads(req.data)
-        return _FakeHTTPResponse({
-            "message": {"content": "cat"},
-            "logprobs": [{"token": "cat", "logprob": -0.1,
-                          "top_logprobs": [{"token": "cat", "logprob": -0.1}, {"token": "dog", "logprob": -2.0}]}],
-        })
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-    client = Client(model="qwen3.5:4b", backend=OllamaBackend(host="http://localhost:11434"))
+def test_multimodal_row_end_to_end_through_a_fake_backend():
+    # A Backend receives the row's content blocks in decidr's own
+    # generic shape (build_prefix_messages's output) -- converting that
+    # to a specific provider's wire format (e.g. OpenAI's "image_url")
+    # is each backend's own job, tested separately in
+    # test_to_openai_message_* above, not something a generic Backend
+    # implementation ever sees.
+    class FakeBackend(Backend):
+        def chat(self, model, messages, max_tokens=1):
+            sent_content = messages[-1]["content"]
+            assert isinstance(sent_content, list)
+            assert any(part["type"] == "image" for part in sent_content)
+            return {
+                "content": "cat",
+                "logprobs": [{"token": "cat", "logprob": -0.1, "top_logprobs": [{"token": "cat", "logprob": -0.1}, {"token": "dog", "logprob": -2.0}]}],
+            }
+
+    client = Client(model="gpt-4o-mini", backend=FakeBackend(), cache=False)
     decision = client.decide(_image_row([{"type": "image", "data": "aGVsbG8="}]))
-
     assert decision.choice == "cat"
-    sent_message = captured["body"]["messages"][-1]
-    assert sent_message["images"] == ["aGVsbG8="]

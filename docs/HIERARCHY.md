@@ -6,13 +6,13 @@ Code: [`src/decidr/prefix.py`](../src/decidr/prefix.py) (`build_tree`, `TreeNode
 
 ## The problem, measured
 
-`top_logprobs` is a rank window — Ollama returns the top 20 tokens by probability at a position, nothing else. When a decision only has a handful of options, all of them plausibly land inside that window. When it has many, most of them don't, and it has nothing to do with whether they're right.
+`top_logprobs` is a rank window — most providers checked cap it at 20 tokens by probability at a position, nothing else (OpenAI's own documented hard limit; see [docs/PROVIDERS.md](PROVIDERS.md)). When a decision only has a handful of options, all of them plausibly land inside that window. When it has many, most of them don't, and it has nothing to do with whether they're right.
 
-Measured directly against `qwen3.5:4b`, asking which of 30 genuinely distinct support categories fits a login error, in one flat request:
+Measured directly against `qwen3.5:4b` via Ollama's OpenAI-compatible endpoint, asking which of 30 genuinely distinct support categories fits a login error, in one flat request:
 
 | `top_logprobs` | Categories that appeared at all |
 |---|---:|
-| 20 (Ollama's cap) | 5 / 30 |
+| 20 (the common provider cap) | 5 / 30 |
 | 100 | 12 / 30 |
 
 Raising the window helped, but the tail didn't move much: by rank 90, logprobs were already around -13 — the model was that unlikely to say those words next in a 30-way free-for-all, not because they're bad categories, but because a handful of dominant candidates soak up nearly all the probability mass when everything competes at once. `shipping` and `refund` (both real, sensible categories) sat at rank 86 and 89. No realistic window size fixes this; it's a property of putting 30 things in one race, not a property of the window.
@@ -55,11 +55,11 @@ eliminated: ['billing_refund', 'billing_dispute']
 
 `billing`'s two options lost the very first race (against `access`) without ever being individually compared to each other — we don't know which one *would* have won, or its score, so both are `eliminated`. All three `access_*` options, on the other hand, went through a real race against each other directly and all have comparable numbers.
 
-`Decision.is_reliable()` checks `unscored` only (a genuine measurement gap — a segment value that never showed up in a race's results at all), never `eliminated`. A branch losing a real, complete race to a real peer is the hierarchy working as intended, not a failure.
+`is_reliable(decision)` checks `unscored` only (a genuine measurement gap — a segment value that never showed up in a race's results at all), never `eliminated`. A branch losing a real, complete race to a real peer is the hierarchy working as intended, not a failure.
 
 ## Exhaustive vs. cheap: `Client(exhaustive=...)`
 
-By default (`exhaustive=True`), every branch gets explored, not just the winning path — a losing branch with its own children still gets raced, so its leaves end up with real, comparable probabilities instead of `eliminated`. This costs more requests (one per internal node in the whole tree, not just along one path) in exchange for a complete distribution.
+By default (`exhaustive=True`), every branch gets explored, not just the winning path — a losing branch with its own children still gets raced, so its leaves end up with real, comparable probabilities instead of `eliminated`. This costs more requests (one per internal node in the whole tree, not just along one path) in exchange for a complete distribution. Independent branches at one node are fired concurrently on a shared thread pool, not one at a time — the request *count* is the same either way, but exploring every branch costs closer to one round-trip's worth of wall-clock time, not one per branch.
 
 `Client(model=..., exhaustive=False)` reverts to following only the winning path: a losing branch that's already a single leaf is still kept (it cost nothing extra — its number came from the race that just ran), but a losing branch with further children is left unexplored and its leaves go to `eliminated`.
 
@@ -83,9 +83,8 @@ The hierarchy avoids this by using structure the caller already has a reason to 
 A node's own child count is still bounded — `MAX_BRANCHES_PER_LEVEL` (16) in `core.py`. If a single level has more distinct branches than that, `decide()` raises a clear error asking for another level of hierarchy rather than trying to force an oversized race through:
 
 ```
-DecisionError: 22 distinct branches at hierarchy level '' exceeds the 16
-that can reliably race at once. Add another underscore-separated level to
-these ids to split the branching further.
+DecisionError: level '(root)' has 22 branches, over the limit of 16 --
+add another id segment to split it further
 ```
 
 This is a real constraint on how flat a taxonomy can be at any one level, not a soft suggestion — a level over the cap would just reproduce the original 30-category problem locally, one level down.
