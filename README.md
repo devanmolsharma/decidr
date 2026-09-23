@@ -148,6 +148,57 @@ decision = client.decide(row)  # faster: warm connection, and (if warmup ran
 
 Independent requests within one round, independent hierarchy branches, and separate rows passed to `Client.decide_all(rows)` are all sent concurrently on a shared, bounded thread pool (`Client(..., max_workers=16)` to tune it), not one at a time — `decide_all`'s wall-clock cost for N rows lands close to one row's latency rather than N times it.
 
+**A real, measured caveat specific to this port:** at high fan-out (13
+concurrent `truth()` calls in one batch), Python's GIL measurably serializes
+the pure-Python bookkeeping each call does around its HTTP request — a
+single `truth()` call is 166–193ms (matching decidr-ts), but 13 of them
+fired concurrently on the thread pool land around 740–1330ms total, not
+close to one call's latency the way decidr-ts's concurrent dispatch does.
+Confirmed by isolating the raw HTTP layer: 13 concurrent `backend.chat()`
+calls with no `decide()` logic around them complete in ~366ms, the same
+range as decidr-ts — so the gap is specifically in this port's per-call
+Python-side work under GIL contention, not the network or the pool itself.
+Lower fan-out (a handful of concurrent rows) doesn't show this effect.
+
+## Benchmarks
+
+Measured live (median of 5 runs per cell, each isolated in its own
+process to avoid cross-provider network contention), 10 realistic
+scenarios (1–13 questions each, e.g. support-ticket triage, resume
+screening, content moderation, code review), comparing this port against
+[TypeSafe](https://console.typesafe.ai) (a comparable product that
+answers several questions about one shared input in a single batched
+request — decidr has no equivalent yet, see decidr-ts's
+[BATCHING_DESIGN.md](https://github.com/devanmolsharma/decidr-ts/blob/main/docs/BATCHING_DESIGN.md)
+for a real, not-yet-built design for one). Every decidr cell fires
+`Client.truth()` concurrently across that scenario's questions via the
+shared thread pool, one real HTTPS request per question; every TypeSafe
+cell is its one real batched request:
+
+| Scenario | Questions | decidr + Cerebras (`qwen-3.8-27b`) | TypeSafe (`jev-latest`) |
+|---|---:|---:|---:|
+| single-question-triage | 1 | 175ms | 255ms |
+| billing-dispute | 13 | 1050ms | 231ms |
+| resume-screen | 5 | 220ms | 260ms |
+| content-moderation | 8 | 310ms | 191ms |
+| medical-intake | 2 | 180ms | 218ms |
+| legal-doc-review | 6 | 407ms | 236ms |
+| code-review | 4 | 187ms | 237ms |
+| single-question-fraud | 1 | 173ms | 307ms |
+| email-routing | 3 | 195ms | 252ms |
+| product-review-analysis | 10 | 367ms | 205ms |
+
+At low question counts, this port's per-request floor is competitive
+with (sometimes faster than) TypeSafe's batched call. At higher question
+counts, the GIL-contention effect described above dominates and the gap
+widens well past what decidr-ts sees on the identical scenarios and
+provider — decidr-ts's 13-question scenario lands around 350ms against
+the same Cerebras model, roughly a third of this port's 1050ms. None of
+this changes correctness — `Client.truth()` still returns the same
+calibrated, `logprobs`-derived probability either way; it's purely a
+latency characteristic of this port's concurrency model under high
+fan-out.
+
 ## Reading a `Decision`
 
 | Field | |
