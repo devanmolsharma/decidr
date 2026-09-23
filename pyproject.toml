@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "decidr"
-version = "0.8.0"
+version = "0.9.0"
 description = "Typed decisions from an LLM in one forward pass -- OpenAI, Ollama, or any OpenAI-compatible endpoint"
 readme = "README.md"
 requires-python = ">=3.10"
